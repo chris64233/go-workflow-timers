@@ -1,2 +1,8 @@
-// Package workflowtimers contains the 持久化定时器服务 service.
+// Package workflowtimers 实现持久化工作流定时器：创建、重排、取消、
+// 到期领取（带期限租约）、触发确认（结果与 outbox 原子落盘）以及待执行查询。
+//
+// 本包的内存实现 MemoryStore 用单一互斥锁模拟可串行化数据库事务；每个公开
+// 方法对应一条数据库事务，方法内的条件检查与写入在同一个临界区内完成，
+// 因此可以安全地被多个 goroutine 并发调用。换成真实数据库时，只需用
+// “条件 UPDATE / 唯一索引”复现同样的判定即可（各方法注释中给出了等价 SQL 语义）。
 package workflowtimers
