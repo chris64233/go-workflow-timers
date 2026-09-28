@@ -63,15 +63,31 @@ type Lease struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// Outbox entry 类型。
+const (
+	// OutboxKindTimer 一次性定时器触发（零值兼容旧快照）。
+	OutboxKindTimer = ""
+	// OutboxKindScheduleInstance 周期计划实例触发。
+	OutboxKindScheduleInstance = "schedule_instance"
+)
+
 // OutboxEntry 是触发时原子写入的 outbox 记录。
-// IdempotencyKey 稳定（workflow/timer/version），传输层重复投递不会产生第二次逻辑触发。
+// 一次性定时器的 IdempotencyKey 稳定（workflow/timer/version）；
+// 周期计划实例的键稳定（workflow/schedule/vN/seq）。
+// 传输层重复投递不会产生第二次逻辑触发。
 type OutboxEntry struct {
 	IdempotencyKey string    `json:"idempotency_key"`
 	WorkflowID     string    `json:"workflow_id"`
-	TimerID        string    `json:"timer_id"`
+	TimerID        string    `json:"timer_id,omitempty"`
 	Version        int64     `json:"version"`
 	Result         []byte    `json:"result,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
+
+	// 周期计划实例专属字段；一次性定时器留空。
+	Kind        string    `json:"kind,omitempty"`
+	ScheduleID  string    `json:"schedule_id,omitempty"`
+	InstanceSeq int64     `json:"instance_seq,omitempty"`
+	ScheduledAt time.Time `json:"scheduled_at,omitempty"`
 }
 
 // IdempotencyKey 返回某个定时器版本的稳定幂等键。
@@ -93,15 +109,32 @@ type snapshot struct {
 	Requests map[string]*requestRecord `json:"requests"`
 	Outbox   map[string]*OutboxEntry   `json:"outbox"`
 	LeaseSeq int64                     `json:"lease_seq"`
+
+	// 周期计划：当前计划头、冻结的历史版本、生成的实例。
+	Schedules        map[string]*Schedule        `json:"schedules,omitempty"`
+	ScheduleVersions map[string]*ScheduleVersion `json:"schedule_versions,omitempty"`
+	Instances        map[string]*Instance        `json:"instances,omitempty"`
 }
 
 func newSnapshot() *snapshot {
 	return &snapshot{
-		Timers:   make(map[string]*Timer),
-		Requests: make(map[string]*requestRecord),
-		Outbox:   make(map[string]*OutboxEntry),
+		Timers:           make(map[string]*Timer),
+		Requests:         make(map[string]*requestRecord),
+		Outbox:           make(map[string]*OutboxEntry),
+		Schedules:        make(map[string]*Schedule),
+		ScheduleVersions: make(map[string]*ScheduleVersion),
+		Instances:        make(map[string]*Instance),
 	}
 }
 
 func timerKey(workflowID, timerID string) string     { return workflowID + "\x1f" + timerID }
 func requestKey(workflowID, requestID string) string { return workflowID + "\x1f" + requestID }
+
+// 周期计划相关的键构造。\x1f/\x1e 为控制字符，不允许出现在外部 ID 中。
+func scheduleKey(workflowID, scheduleID string) string { return workflowID + "\x1f" + scheduleID }
+func versionKey(workflowID, scheduleID string, version int64) string {
+	return fmt.Sprintf("%s\x1f%s\x1fv%d", workflowID, scheduleID, version)
+}
+func instanceKey(workflowID, scheduleID string, version, seq int64) string {
+	return fmt.Sprintf("%s\x1f%s\x1fv%d\x1ei%d", workflowID, scheduleID, version, seq)
+}

@@ -43,10 +43,13 @@ type WriteResult struct {
 	Version int64
 }
 
-// Claim 是一次领取获得的定时器与租约。
+// Claim 是一次领取获得的定时器（或周期计划实例）与租约。
+// Timer 与 Instance 互斥：Timer != nil 为一次性定时器，Instance != nil 为计划实例。
 type Claim struct {
-	Timer   Timer
+	Timer   *Timer
 	LeaseID string
+	// 以下仅周期计划实例有值。
+	Instance *Instance
 }
 
 // FireReceipt 是触发确认的回执。Duplicate 表示这是对同一版本的重复确认，
@@ -64,6 +67,8 @@ type Service struct {
 	store Store
 	now   func() time.Time
 	state *snapshot
+	// locs 缓存已加载的 IANA 时区。
+	locs map[string]*time.Location
 }
 
 // NewService 从 Store 恢复状态并构建服务。
@@ -75,7 +80,17 @@ func NewService(store Store) (*Service, error) {
 	if s.Timers == nil {
 		s = newSnapshot()
 	}
-	return &Service{store: store, now: time.Now, state: s}, nil
+	// 兼容旧版本快照（尚无周期计划字段）。
+	if s.Schedules == nil {
+		s.Schedules = make(map[string]*Schedule)
+	}
+	if s.ScheduleVersions == nil {
+		s.ScheduleVersions = make(map[string]*ScheduleVersion)
+	}
+	if s.Instances == nil {
+		s.Instances = make(map[string]*Instance)
+	}
+	return &Service{store: store, now: time.Now, state: s, locs: make(map[string]*time.Location)}, nil
 }
 
 // WithClock 注入时钟（测试用）。
@@ -224,8 +239,18 @@ func (s *Service) mutableTimer(workflowID, timerID string) (*Timer, error) {
 	return t, nil
 }
 
-// ClaimDue 批量领取到期定时器：Pending、FireAt <= now 且租约缺失或已过期。
-// 每次领取生成新 LeaseID 与递增的围栏令牌，租约有效期为 ttl。
+// claimCandidate 是领取队列中的一个可领取对象（一次性定时器或计划实例）。
+type claimCandidate struct {
+	dueAt time.Time
+	order string // 到期时间相同时的稳定次序
+	timer *Timer
+	inst  *Instance
+}
+
+// ClaimDue 批量领取到期对象（一次性定时器与周期计划实例统一排队）：
+// Pending、到期时间 <= now 且租约缺失或已过期。
+// 每次领取生成新 LeaseID 与全局递增的围栏令牌，租约有效期为 ttl。
+// 返回的每个 Claim 中 Timer 与 Instance 互斥。
 func (s *Service) ClaimDue(owner string, limit int, ttl time.Duration) ([]Claim, error) {
 	if owner == "" {
 		return nil, errors.New("owner is required")
@@ -237,7 +262,7 @@ func (s *Service) ClaimDue(owner string, limit int, ttl time.Duration) ([]Claim,
 	defer s.mu.Unlock()
 
 	now := s.now()
-	var due []*Timer
+	var due []claimCandidate
 	for _, t := range s.state.Timers {
 		if t.State != StatePending || t.FireAt.After(now) {
 			continue
@@ -245,20 +270,33 @@ func (s *Service) ClaimDue(owner string, limit int, ttl time.Duration) ([]Claim,
 		if t.Lease != nil && t.Lease.ExpiresAt.After(now) {
 			continue // 租约仍有效
 		}
-		due = append(due, t)
+		due = append(due, claimCandidate{dueAt: t.FireAt, order: "t:" + t.WorkflowID + "/" + t.TimerID, timer: t})
+	}
+	for _, in := range s.state.Instances {
+		if in.State != InstancePending || in.ScheduledAt.After(now) {
+			continue
+		}
+		if in.Lease != nil && in.Lease.ExpiresAt.After(now) {
+			continue
+		}
+		due = append(due, claimCandidate{
+			dueAt: in.ScheduledAt,
+			order: fmt.Sprintf("i:%s/%s/v%d#%d", in.WorkflowID, in.ScheduleID, in.Version, in.Seq),
+			inst:  in,
+		})
 	}
 	sort.Slice(due, func(i, j int) bool {
-		if !due[i].FireAt.Equal(due[j].FireAt) {
-			return due[i].FireAt.Before(due[j].FireAt)
+		if !due[i].dueAt.Equal(due[j].dueAt) {
+			return due[i].dueAt.Before(due[j].dueAt)
 		}
-		return due[i].TimerID < due[j].TimerID
+		return due[i].order < due[j].order
 	})
 	if len(due) > limit {
 		due = due[:limit]
 	}
 
 	claims := make([]Claim, 0, len(due))
-	for _, t := range due {
+	for _, c := range due {
 		s.state.LeaseSeq++
 		lease := &Lease{
 			LeaseID:   newLeaseID(),
@@ -266,12 +304,23 @@ func (s *Service) ClaimDue(owner string, limit int, ttl time.Duration) ([]Claim,
 			Token:     s.state.LeaseSeq,
 			ExpiresAt: now.Add(ttl),
 		}
-		t.Lease = lease
-		t.UpdatedAt = now
-		snap := *t
-		leaseCopy := *lease
-		snap.Lease = &leaseCopy
-		claims = append(claims, Claim{Timer: snap, LeaseID: lease.LeaseID})
+		if c.timer != nil {
+			t := c.timer
+			t.Lease = lease
+			t.UpdatedAt = now
+			snap := *t
+			leaseCopy := *lease
+			snap.Lease = &leaseCopy
+			claims = append(claims, Claim{Timer: &snap, LeaseID: lease.LeaseID})
+		} else {
+			in := c.inst
+			in.Lease = lease
+			in.UpdatedAt = now
+			snap := *in
+			leaseCopy := *lease
+			snap.Lease = &leaseCopy
+			claims = append(claims, Claim{Instance: &snap, LeaseID: lease.LeaseID})
+		}
 	}
 	if len(claims) > 0 {
 		if err := s.store.Save(s.state); err != nil {
