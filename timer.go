@@ -64,12 +64,18 @@ type Lease struct {
 }
 
 // OutboxEntry 是触发时原子写入的 outbox 记录。
-// IdempotencyKey 稳定（workflow/timer/version），传输层重复投递不会产生第二次逻辑触发。
+// 单次定时器的幂等键为 workflow/timer/version；
+// 周期实例的幂等键为 workflow/schedule/version/seq。
+// 键稳定，传输层重复投递不会产生第二次逻辑触发。
 type OutboxEntry struct {
 	IdempotencyKey string    `json:"idempotency_key"`
 	WorkflowID     string    `json:"workflow_id"`
-	TimerID        string    `json:"timer_id"`
+	TimerID        string    `json:"timer_id,omitempty"` // 单次定时器号
+	ScheduleID     string    `json:"schedule_id,omitempty"`
+	InstanceID     string    `json:"instance_id,omitempty"`
 	Version        int64     `json:"version"`
+	Seq            int64     `json:"seq,omitempty"`          // 周期实例的版本内序号
+	ScheduledAt    time.Time `json:"scheduled_at,omitempty"` // 实例的计划时间
 	Result         []byte    `json:"result,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 }
@@ -89,19 +95,27 @@ type requestRecord struct {
 
 // snapshot 是持久化的全部状态。
 type snapshot struct {
-	Timers   map[string]*Timer         `json:"timers"`
-	Requests map[string]*requestRecord `json:"requests"`
-	Outbox   map[string]*OutboxEntry   `json:"outbox"`
-	LeaseSeq int64                     `json:"lease_seq"`
+	Timers    map[string]*Timer         `json:"timers"`
+	Schedules map[string]*Schedule      `json:"schedules"`
+	Instances map[string]*Instance      `json:"instances"`
+	Requests  map[string]*requestRecord `json:"requests"`
+	Outbox    map[string]*OutboxEntry   `json:"outbox"`
+	LeaseSeq  int64                     `json:"lease_seq"`
 }
 
 func newSnapshot() *snapshot {
 	return &snapshot{
-		Timers:   make(map[string]*Timer),
-		Requests: make(map[string]*requestRecord),
-		Outbox:   make(map[string]*OutboxEntry),
+		Timers:    make(map[string]*Timer),
+		Schedules: make(map[string]*Schedule),
+		Instances: make(map[string]*Instance),
+		Requests:  make(map[string]*requestRecord),
+		Outbox:    make(map[string]*OutboxEntry),
 	}
 }
 
-func timerKey(workflowID, timerID string) string     { return workflowID + "\x1f" + timerID }
-func requestKey(workflowID, requestID string) string { return workflowID + "\x1f" + requestID }
+func timerKey(workflowID, timerID string) string { return workflowID + "\x1f" + timerID }
+func scheduleKey(workflowID, scheduleID string) string {
+	return workflowID + "\x1f" + scheduleID
+}
+func instanceKey(workflowID, instanceID string) string { return workflowID + "\x1f" + instanceID }
+func requestKey(workflowID, requestID string) string   { return workflowID + "\x1f" + requestID }

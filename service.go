@@ -75,6 +75,13 @@ func NewService(store Store) (*Service, error) {
 	if s.Timers == nil {
 		s = newSnapshot()
 	}
+	// 兼容旧版本快照：补齐新增的计划/实例映射。
+	if s.Schedules == nil {
+		s.Schedules = make(map[string]*Schedule)
+	}
+	if s.Instances == nil {
+		s.Instances = make(map[string]*Instance)
+	}
 	return &Service{store: store, now: time.Now, state: s}, nil
 }
 
